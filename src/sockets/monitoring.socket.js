@@ -8,39 +8,76 @@ class MonitoringManager {
   constructor() {
     this.socketIntervals = new Map();
     this.previousData = new Map();
+    this.intervalMs = 1000;
   }
 
-  startMonitoring(socket, mikrotikApi, interfaceName = 'LAN-ATTACKER') {
+  startMonitoring(socket, mikrotikApi) {
     console.log(`[WebSocket] Starting monitoring for socket ${socket.id}`);
-    
-    const intervalId = setInterval(async () => {
+
+    this.stopMonitoring(socket.id);
+    this.socketIntervals.set(socket.id, null);
+
+    const runMonitoring = async (isPriming = false) => {
+      if (!this.socketIntervals.has(socket.id)) {
+        return;
+      }
+
       try {
-        // Get dynamic router info
-        const dynamicInfo = await getRouterDynamicInfo(mikrotikApi);
-        
-        // Calculate throughput
-        let throughput = { rx_bps: 0, tx_bps: 0 };
-        if (dynamicInfo.interface) {
-          const now = Date.now();
-          const previous = this.previousData.get(socket.id);
-          
-          if (previous && previous.timestamp) {
-            const timeDiff = (now - previous.timestamp) / 1000;
-            throughput = calculateThroughput(
-              dynamicInfo.interface,
-              previous.interface,
-              timeDiff
-            );
-          }
-          
-          this.previousData.set(socket.id, {
-            interface: dynamicInfo.interface,
-            timestamp: now,
+        const [dynamicInfo, latency] = await Promise.all([
+          getRouterDynamicInfo(mikrotikApi),
+          pingTarget(mikrotikApi),
+        ]);
+
+        const now = Date.now();
+        const previous = this.previousData.get(socket.id);
+        let throughput = previous?.throughput ?? null;
+        let throughputByInterface = [];
+        let previousInterfaces = previous?.interfaces ?? {};
+
+        if (previous && previous.timestamp) {
+          const timeDiff = (now - previous.timestamp) / 1000;
+          throughputByInterface = dynamicInfo.interfaces.map((iface) => {
+            const previousInterface = previousInterfaces[iface.name];
+            if (!previousInterface) {
+              return {
+                name: iface.name,
+                rx_bps: null,
+                tx_bps: null,
+              };
+            }
+
+            return {
+              name: iface.name,
+              ...calculateThroughput(iface, previousInterface, timeDiff),
+            };
           });
+
+          throughput = throughputByInterface.reduce(
+            (acc, item) => ({
+              rx_bps: acc.rx_bps + (item.rx_bps ?? 0),
+              tx_bps: acc.tx_bps + (item.tx_bps ?? 0),
+            }),
+            { rx_bps: 0, tx_bps: 0 }
+          );
         }
 
-        // Get ping/latency
-        const latency = await pingTarget(mikrotikApi);
+        const currentInterfaces = dynamicInfo.interfaces.reduce((acc, iface) => {
+          acc[iface.name] = {
+            rx_bytes: iface.rx_bytes,
+            tx_bytes: iface.tx_bytes,
+          };
+          return acc;
+        }, {});
+
+        this.previousData.set(socket.id, {
+          interfaces: currentInterfaces,
+          timestamp: now,
+          throughput,
+        });
+
+        if (isPriming && !previous) {
+          return;
+        }
 
         // Emit data
         socket.emit('monitoring:data', {
@@ -49,9 +86,10 @@ class MonitoringManager {
           memory: dynamicInfo.memory,
           uptime: dynamicInfo.uptime,
           throughput,
+          throughput_by_interface: throughputByInterface,
+          interfaces: dynamicInfo.interfaces,
           latency,
         });
-
       } catch (error) {
         console.error(`[WebSocket] Error for socket ${socket.id}:`, error.message);
         socket.emit('monitoring:error', {
@@ -60,9 +98,16 @@ class MonitoringManager {
           timestamp: Date.now(),
         });
       }
-    }, 2000); // Update every 2 seconds
 
-    this.socketIntervals.set(socket.id, intervalId);
+      if (!this.socketIntervals.has(socket.id)) {
+        return;
+      }
+
+      const timeoutId = setTimeout(() => runMonitoring(false), this.intervalMs);
+      this.socketIntervals.set(socket.id, timeoutId);
+    };
+
+    runMonitoring(true);
   }
 
   stopMonitoring(socketId) {
@@ -70,16 +115,16 @@ class MonitoringManager {
     
     const intervalId = this.socketIntervals.get(socketId);
     if (intervalId) {
-      clearInterval(intervalId);
-      this.socketIntervals.delete(socketId);
+      clearTimeout(intervalId);
     }
+    this.socketIntervals.delete(socketId);
     
     this.previousData.delete(socketId);
   }
 
   cleanup() {
     for (const [socketId, intervalId] of this.socketIntervals.entries()) {
-      clearInterval(intervalId);
+      clearTimeout(intervalId);
       console.log(`[WebSocket] Cleaned up interval for socket ${socketId}`);
     }
     this.socketIntervals.clear();

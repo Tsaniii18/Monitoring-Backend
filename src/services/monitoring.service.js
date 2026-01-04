@@ -33,8 +33,16 @@ export const getRouterDynamicInfo = async (mikrotikApi) => {
     mikrotikApi.get('/interface'),
   ]);
 
-  const targetInterface = interfacesRes.data.find(i => i.name === 'LAN-ATTACKER');
-  
+  const interfaces = interfacesRes.data.map(iface => ({
+    name: iface.name,
+    type: iface.type,
+    running: iface.running,
+    rx_bytes: Number(iface['rx-byte']),
+    tx_bytes: Number(iface['tx-byte']),
+    rx_packets: Number(iface['rx-packet']),
+    tx_packets: Number(iface['tx-packet']),
+  }));
+
   return {
     timestamp: Date.now(),
     cpu: {
@@ -47,12 +55,7 @@ export const getRouterDynamicInfo = async (mikrotikApi) => {
       used: resourceRes.data['total-memory'] - resourceRes.data['free-memory'],
     },
     uptime: resourceRes.data.uptime,
-    interface: targetInterface ? {
-      rx_bytes: Number(targetInterface['rx-byte']),
-      tx_bytes: Number(targetInterface['tx-byte']),
-      rx_packets: Number(targetInterface['rx-packet']),
-      tx_packets: Number(targetInterface['tx-packet']),
-    } : null,
+    interfaces,
   };
 };
 
